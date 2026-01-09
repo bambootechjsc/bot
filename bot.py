@@ -164,6 +164,15 @@ async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     await update.message.reply_text(msg, parse_mode="Markdown")
 
+
+async def list_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id not in ADMIN_IDS: return
+    try:
+        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        msg = "✅ Các Model bạn có thể dùng:\n" + "\n".join([f"`{m}`" for m in models])
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Không thể liệt kê model: {e}")
 # Đừng quên thêm handler: app.add_handler(CommandHandler("check", check_status))
 
 # 8. KHỞI CHẠY
@@ -178,7 +187,9 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("ok", confirm_ok))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CommandHandler("check", check_status))
+    app.add_handler(CommandHandler("listmodels", list_models))
     
     print("Bot is running...")
     app.run_polling()
+
 
