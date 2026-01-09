@@ -11,9 +11,24 @@ from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
+# 1. LOAD CẤU HÌNH
 load_dotenv()
 
-# --- CẤU HÌNH WEB SERVER GIẢ (TRÁNH LỖI PORT) ---
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+GOOGLE_CREDS = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
+ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# 2. KHỞI TẠO GEMINI AI (Đặt ở đây để tránh lỗi 'not defined')
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel('gemini-1.5-flash')
+else:
+    model = None
+    print("⚠️ Thiếu GEMINI_API_KEY")
+
+# 3. WEB SERVER ĐỂ TRÁNH LỖI PORT TRÊN RENDER
 app_web = Flask(__name__)
 
 @app_web.route('/')
@@ -21,23 +36,10 @@ def home():
     return "Bot is running!"
 
 def run_web():
-    # Render cấp cổng qua biến môi trường PORT, mặc định là 8080 nếu chạy local
     port = int(os.environ.get("PORT", 8080))
     app_web.run(host='0.0.0.0', port=port)
 
-# --- CẤU HÌNH BIẾN MÔI TRƯỜNG ---
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-GOOGLE_CREDS = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
-ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-# Cấu hình Gemini AI
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
-
-# --- HÀM HỖ TRỢ ---
+# 4. CÁC HÀM HỖ TRỢ GOOGLE SHEETS
 def get_sheets():
     gc = gspread.service_account_from_dict(GOOGLE_CREDS)
     sh = gc.open_by_key(SHEET_ID)
@@ -52,11 +54,11 @@ def find_product_by_name(search_term, dm_data):
             matches.append({"ma": row[0], "ten": row[1], "rate": int(row[2])})
     return matches
 
-# --- CÁC LỆNH NHẬP / XUẤT ---
+# 5. XỬ LÝ NHẬP/XUẤT THỦ CÔNG
 async def process_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
     args = context.args
     if len(args) < 3:
-        await update.message.reply_text(f"⚠️ Cú pháp: /{mode.lower()} [kho] [tên sp] [sl+t/c]")
+        await update.message.reply_text(f"⚠️ /{mode.lower()} [kho] [tên sp] [sl+t/c]")
         return
     try:
         kho, sl_raw, search_term = args[0].upper(), args[-1].lower(), " ".join(args[1:-1])
@@ -69,23 +71,34 @@ async def process_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE
         final_qty = qty if mode == "NHAP" else -abs(qty)
         
         ws_data.append_row([datetime.now().strftime("%d/%m/%Y %H:%M:%S"), kho, p['ma'], p['ten'], final_qty, mode, update.message.from_user.full_name, sl_raw])
-        await update.message.reply_text(f"✅ {mode} thành công: {p['ten']} ({sl_raw})")
+        await update.message.reply_text(f"✅ {mode}: {p['ten']} ({sl_raw})")
     except Exception as e: await update.message.reply_text(f"❌ Lỗi: {e}")
 
 async def nhap(u, c): await process_transaction(u, c, "NHAP")
 async def xuat(u, c): await process_transaction(u, c, "XUAT")
 
-# --- XỬ LÝ ẢNH AI (GEMINI) ---
+# 6. XỬ LÝ ẢNH AI (GEMINI)
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id not in ADMIN_IDS: return
+    if not model: return await update.message.reply_text("❌ Chưa cấu hình Gemini API Key.")
+
     msg = await update.message.reply_text("🤖 AI đang đọc phiếu...")
     try:
         photo_file = await update.message.photo[-1].get_file()
         img_byte = await photo_file.download_as_bytearray()
         img_part = {"mime_type": "image/jpeg", "data": bytes(img_byte)}
-        prompt = "Bạn là kế toán kho. Đọc ảnh này: 1. Loại: XUAT (trừ khi có chữ NHAP). 2. SP: Tên bên trái, SL là kết quả cuối phép tính. 3. Đơn vị: mặc định 'c'. Trả về duy nhất JSON: {\"type\": \"XUAT\", \"transactions\": [{\"kho\": \"KHO_TONG\", \"ten_sp\": \"Coca\", \"so_luong\": \"65c\"}]}"
+        
+        prompt = """
+        Đọc ảnh phiếu kho: 1. Loại: XUAT (trừ khi có chữ NHAP). 
+        2. SP: Tên bên trái, SL là kết quả cuối phép tính. 
+        3. Đơn vị: mặc định 'c'. 
+        Trả về JSON: {"type": "XUAT", "transactions": [{"kho": "KHO_TONG", "ten_sp": "Coca", "so_luong": "65c"}]}
+        """
+        
         response = model.generate_content([prompt, img_part])
-        data = json.loads(re.sub(r'```json|```', '', response.text).strip())
+        clean_json = re.sub(r'```json|```', '', response.text).strip()
+        data = json.loads(clean_json)
+        
         context.user_data['pending_ai'] = data
         confirm = f"✅ AI đọc được {data['type']}:\n" + "\n".join([f"- {t['ten_sp']}: {t['so_luong']}" for t in data['transactions']]) + "\n\nBấm /ok để ghi hoặc /huy để bỏ."
         await msg.edit_text(confirm)
@@ -105,7 +118,7 @@ async def confirm_ok(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('pending_ai')
     await update.message.reply_text("🎉 Đã ghi kho thành công!")
 
-# --- THỐNG KÊ BIẾN ĐỘNG ---
+# 7. THỐNG KÊ BIẾN ĐỘNG
 async def thongketheogio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id not in ADMIN_IDS: return
     args = context.args
@@ -130,9 +143,9 @@ async def thongketheogio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg)
     except Exception as e: await update.message.reply_text(f"Lỗi: {e}")
 
-# --- CHẠY BOT ---
+# 8. KHỞI CHẠY
 if __name__ == "__main__":
-    # Khởi chạy luồng Web Server để Render không báo lỗi Port
+    # Chạy Web Server ở luồng riêng để tránh lỗi Port trên Render
     threading.Thread(target=run_web, daemon=True).start()
 
     app = ApplicationBuilder().token(TOKEN).build()
@@ -142,5 +155,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("ok", confirm_ok))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     
-    print("Bot is starting with Web Service thread...")
+    print("Bot is running...")
     app.run_polling()
