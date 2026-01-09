@@ -23,7 +23,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # 2. KHỞI TẠO GEMINI AI (Đặt ở đây để tránh lỗi 'not defined')
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    model = genai.GenerativeModel('gemini-2.5-flash')
 else:
     model = None
     print("⚠️ Thiếu GEMINI_API_KEY")
@@ -191,5 +191,6 @@ if __name__ == "__main__":
     
     print("Bot is running...")
     app.run_polling()
+
 
 
