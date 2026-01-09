@@ -1,4 +1,4 @@
-.env
-credentials.json
-__pycache__/
-*.pyc
+python-telegram-bot
+gspread
+oauth2client
+python-dotenv
