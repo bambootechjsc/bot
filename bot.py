@@ -1,162 +1,19 @@
 import os
 import json
 import re
+import io
+import threading
 from datetime import datetime
 from dotenv import load_dotenv
 import gspread
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import google.generativeai as genai
 from flask import Flask
-import threading
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
-# Load biến môi trường
 load_dotenv()
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-GOOGLE_CREDS = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
-# Danh sách Admin ID (ngăn cách bởi dấu phẩy)
-ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
-
-# Kết nối Google Sheets
-def get_sheets():
-    gc = gspread.service_account_from_dict(GOOGLE_CREDS)
-    sh = gc.open_by_key(SHEET_ID)
-    return sh.worksheet("DATA"), sh.worksheet("DANH_MUC")
-
-# --- HÀM TÌM KIẾM THÔNG MINH ---
-def find_product_by_name(search_term, dm_data):
-    search_term = search_term.strip().lower()
-    matches = []
-    for row in dm_data:
-        if len(row) < 3: continue
-        ma_sp, ten_sp, rate = row[0], row[1], row[2]
-        if search_term in ten_sp.lower() or search_term == ma_sp.lower():
-            matches.append({"ma": ma_sp, "ten": ten_sp, "rate": int(rate)})
-    return matches
-
-# --- LỆNH NHẬP / XUẤT (Dành cho mọi người) ---
-async def process_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
-    args = context.args
-    user = update.message.from_user
-    full_name = user.full_name if user.full_name else f"@{user.username}"
-    
-    if len(args) < 3:
-        await update.message.reply_text(f"⚠️ Cú pháp: /{mode.lower()} [kho] [tên sp] [sl+t/c]\nVí dụ: /{mode.lower()} KHO1 BIA 10t")
-        return
-
-    try:
-        kho = args[0].upper()
-        sl_raw = args[-1].lower()
-        search_term = " ".join(args[1:-1])
-        
-        ws_data, ws_dm = get_sheets()
-        dm_data = ws_dm.get_all_values()[1:]
-        
-        products = find_product_by_name(search_term, dm_data)
-        
-        if not products:
-            await update.message.reply_text(f"❌ Không thấy SP nào tên '{search_term}'")
-            return
-        if len(products) > 1:
-            goi_y = "\n".join([f"• {p['ten']}" for p in products])
-            await update.message.reply_text(f"🧐 Có nhiều loại, hãy nhập rõ hơn:\n{goi_y}")
-            return
-        
-        p = products[0]
-        # Quy đổi đơn vị
-        if sl_raw.endswith('t'):
-            qty = int(sl_raw[:-1]) * p['rate']
-            don_vi = f"{sl_raw[:-1]} Thùng"
-        elif sl_raw.endswith('c'):
-            qty = int(sl_raw[:-1])
-            don_vi = f"{sl_raw[:-1]} Chai"
-        else:
-            await update.message.reply_text("❌ Thiếu đơn vị! Thêm 't' (thùng) hoặc 'c' (chai).")
-            return
-
-        final_qty = qty if mode == "NHAP" else -abs(qty)
-        row = [datetime.now().strftime("%d/%m/%Y %H:%M:%S"), kho, p['ma'], p['ten'], final_qty, mode, full_name, don_vi, str(user.id)]
-        ws_data.append_row(row)
-        
-        icon = "📥" if mode == "NHAP" else "📤"
-        await update.message.reply_text(f"{icon} **{mode} thành công!**\n📦 {p['ten']}\n🔢 Tổng: {abs(final_qty)} chai ({don_vi})", parse_mode="Markdown")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Lỗi: {str(e)}")
-
-async def nhap(u, c): await process_transaction(u, c, "NHAP")
-async def xuat(u, c): await process_transaction(u, c, "XUAT")
-
-# --- QUẢN LÝ SẢN PHẨM (Chỉ Admin) ---
-async def sanpham(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.from_user.id not in ADMIN_IDS:
-        await update.message.reply_text("🚫 Quyền Admin mới được dùng lệnh này.")
-        return
-    
-    args = context.args # /sp [tên] [tỷ lệ]
-    if len(args) < 2:
-        await update.message.reply_text("⚠️ Cú pháp: /sp [tên] [tỷ lệ]\nVí dụ: /sp Bia Saigon 24")
-        return
-
-    try:
-        ty_le = args[-1]
-        ten_sp = " ".join(args[:-1])
-        ma_sp = re.sub(r'\s+', '_', ten_sp).upper()
-
-        ws_data, ws_dm = get_sheets()
-        dm_data = ws_dm.get_all_values()
-        
-        idx = next((i+1 for i, r in enumerate(dm_data) if r[1].lower() == ten_sp.lower()), -1)
-        
-        if idx != -1:
-            ws_dm.update_cell(idx, 3, ty_le)
-            msg = f"🔄 Cập nhật tỷ lệ: {ten_sp}"
-        else:
-            ws_dm.append_row([ma_sp, ten_sp, ty_le])
-            msg = f"✨ Thêm mới SP: {ten_sp}"
-
-        await update.message.reply_text(f"{msg}\n🔢 1 thùng = {ty_le} chai")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Lỗi: {e}")
-
-# --- BÁO CÁO TỒN KHO (Chỉ Admin) ---
-async def tonkho(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.from_user.id not in ADMIN_IDS:
-        await update.message.reply_text("🚫 Quyền Admin mới được xem tồn kho.")
-        return
-    try:
-        ws_data, ws_dm = get_sheets()
-        data = ws_data.get_all_values()[1:]
-        dm = ws_dm.get_all_values()[1:]
-        conv = {r[0]: int(r[2]) for r in dm}; name = {r[0]: r[1] for r in dm}
-        
-        inv = {}
-        for r in data:
-            k, m, q = r[1], r[2], int(r[4])
-            if k not in inv: inv[k] = {}
-            inv[k][m] = inv[k].get(m, 0) + q
-
-        search_kho = context.args[0].upper() if context.args else None
-        msg = "📊 **TỒN KHO**\n"
-        for kho, items in inv.items():
-            if search_kho and kho != search_kho: continue
-            msg += f"\n🏢 **KHO: {kho}**\n"
-            for ma, total in items.items():
-                if total == 0: continue
-                rate = conv.get(ma, 1)
-                t, c = total // rate, total % rate
-                res = (f"{t}t " if t > 0 else "") + (f"{c}c" if c > 0 else "")
-                msg += f"• `{name.get(ma, ma)}`: {res} ({total} chai)\n"
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Lỗi: {e}")
-
-async def danhsach(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _, ws_dm = get_sheets()
-    dm = ws_dm.get_all_values()[1:]
-    msg = "📋 **DANH MỤC**\n" + "\n".join([f"• {r[1]} (1t={r[2]}c)" for r in dm])
-    await update.message.reply_text(msg, parse_mode="Markdown")
-# Tạo một web server nhỏ để Render không báo lỗi Port
+# --- CẤU HÌNH WEB SERVER GIẢ (TRÁNH LỖI PORT) ---
 app_web = Flask(__name__)
 
 @app_web.route('/')
@@ -164,18 +21,126 @@ def home():
     return "Bot is running!"
 
 def run_web():
-    # Render cung cấp cổng qua biến môi trường PORT
+    # Render cấp cổng qua biến môi trường PORT, mặc định là 8080 nếu chạy local
     port = int(os.environ.get("PORT", 8080))
     app_web.run(host='0.0.0.0', port=port)
 
+# --- CẤU HÌNH BIẾN MÔI TRƯỜNG ---
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+GOOGLE_CREDS = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
+ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Cấu hình Gemini AI
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel('gemini-1.5-flash')
+
+# --- HÀM HỖ TRỢ ---
+def get_sheets():
+    gc = gspread.service_account_from_dict(GOOGLE_CREDS)
+    sh = gc.open_by_key(SHEET_ID)
+    return sh.worksheet("DATA"), sh.worksheet("DANH_MUC")
+
+def find_product_by_name(search_term, dm_data):
+    search_term = search_term.strip().lower()
+    matches = []
+    for row in dm_data:
+        if len(row) < 3: continue
+        if search_term in row[1].lower() or search_term == row[0].lower():
+            matches.append({"ma": row[0], "ten": row[1], "rate": int(row[2])})
+    return matches
+
+# --- CÁC LỆNH NHẬP / XUẤT ---
+async def process_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text(f"⚠️ Cú pháp: /{mode.lower()} [kho] [tên sp] [sl+t/c]")
+        return
+    try:
+        kho, sl_raw, search_term = args[0].upper(), args[-1].lower(), " ".join(args[1:-1])
+        ws_data, ws_dm = get_sheets()
+        products = find_product_by_name(search_term, ws_dm.get_all_values()[1:])
+        if not products: return await update.message.reply_text(f"❌ Không thấy SP '{search_term}'")
+        
+        p = products[0]
+        qty = int(sl_raw[:-1]) * (p['rate'] if sl_raw.endswith('t') else 1)
+        final_qty = qty if mode == "NHAP" else -abs(qty)
+        
+        ws_data.append_row([datetime.now().strftime("%d/%m/%Y %H:%M:%S"), kho, p['ma'], p['ten'], final_qty, mode, update.message.from_user.full_name, sl_raw])
+        await update.message.reply_text(f"✅ {mode} thành công: {p['ten']} ({sl_raw})")
+    except Exception as e: await update.message.reply_text(f"❌ Lỗi: {e}")
+
+async def nhap(u, c): await process_transaction(u, c, "NHAP")
+async def xuat(u, c): await process_transaction(u, c, "XUAT")
+
+# --- XỬ LÝ ẢNH AI (GEMINI) ---
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id not in ADMIN_IDS: return
+    msg = await update.message.reply_text("🤖 AI đang đọc phiếu...")
+    try:
+        photo_file = await update.message.photo[-1].get_file()
+        img_byte = await photo_file.download_as_bytearray()
+        img_part = {"mime_type": "image/jpeg", "data": bytes(img_byte)}
+        prompt = "Bạn là kế toán kho. Đọc ảnh này: 1. Loại: XUAT (trừ khi có chữ NHAP). 2. SP: Tên bên trái, SL là kết quả cuối phép tính. 3. Đơn vị: mặc định 'c'. Trả về duy nhất JSON: {\"type\": \"XUAT\", \"transactions\": [{\"kho\": \"KHO_TONG\", \"ten_sp\": \"Coca\", \"so_luong\": \"65c\"}]}"
+        response = model.generate_content([prompt, img_part])
+        data = json.loads(re.sub(r'```json|```', '', response.text).strip())
+        context.user_data['pending_ai'] = data
+        confirm = f"✅ AI đọc được {data['type']}:\n" + "\n".join([f"- {t['ten_sp']}: {t['so_luong']}" for t in data['transactions']]) + "\n\nBấm /ok để ghi hoặc /huy để bỏ."
+        await msg.edit_text(confirm)
+    except Exception as e: await msg.edit_text(f"❌ Lỗi AI: {e}")
+
+async def confirm_ok(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data.get('pending_ai')
+    if not data: return
+    ws_data, ws_dm = get_sheets()
+    dm_data = ws_dm.get_all_values()[1:]
+    for tx in data['transactions']:
+        p_list = find_product_by_name(tx['ten_sp'], dm_data)
+        if p_list:
+            p = p_list[0]
+            qty = int(tx['so_luong'][:-1]) * (p['rate'] if tx['so_luong'].endswith('t') else 1)
+            ws_data.append_row([datetime.now().strftime("%d/%m/%Y %H:%M:%S"), tx['kho'], p['ma'], p['ten'], (qty if data['type'] == "NHAP" else -qty), data['type'], update.message.from_user.full_name, tx['so_luong']])
+    context.user_data.pop('pending_ai')
+    await update.message.reply_text("🎉 Đã ghi kho thành công!")
+
+# --- THỐNG KÊ BIẾN ĐỘNG ---
+async def thongketheogio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id not in ADMIN_IDS: return
+    args = context.args
+    if len(args) < 2: return await update.message.reply_text("Cú pháp: /thongketheogio 01/01/2026 10/01/2026")
+    try:
+        start, end = datetime.strptime(args[0], "%d/%m/%Y"), datetime.strptime(args[1], "%d/%m/%Y")
+        ws_data, ws_dm = get_sheets()
+        logs, dm = ws_data.get_all_values()[1:], ws_dm.get_all_values()[1:]
+        names = {r[0]: r[1] for r in dm}
+        res = {}
+        for r in logs:
+            dt = datetime.strptime(r[0].split()[0], "%d/%m/%Y")
+            if start <= dt <= end:
+                k, m, q, tp = r[1], r[2], int(r[4]), r[5]
+                if k not in res: res[k] = {}
+                if m not in res[k]: res[k][m] = {"nhap": 0, "xuat": 0}
+                if tp == "NHAP": res[k][m]["nhap"] += abs(q)
+                else: res[k][m]["xuat"] += abs(q)
+        msg = f"📅 Thống kê {args[0]}-{args[1]}:\n"
+        for k, items in res.items():
+            msg += f"\n🏠 Kho: {k}\n" + "\n".join([f"• {names.get(m, m)}: +{t['nhap']}c, -{t['xuat']}c" for m, t in items.items()])
+        await update.message.reply_text(msg)
+    except Exception as e: await update.message.reply_text(f"Lỗi: {e}")
+
+# --- CHẠY BOT ---
 if __name__ == "__main__":
+    # Khởi chạy luồng Web Server để Render không báo lỗi Port
     threading.Thread(target=run_web, daemon=True).start()
+
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("nhap", nhap))
     app.add_handler(CommandHandler("xuat", xuat))
-    app.add_handler(CommandHandler("tonkho", tonkho))
-    app.add_handler(CommandHandler("sp", sanpham))
-    app.add_handler(CommandHandler("ds", danhsach))
-    print("Bot is running...")
+    app.add_handler(CommandHandler("thongketheogio", thongketheogio))
+    app.add_handler(CommandHandler("ok", confirm_ok))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    
+    print("Bot is starting with Web Service thread...")
     app.run_polling()
-
