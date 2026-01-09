@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 import gspread
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from flask import Flask
+import threading
 
 # Load biến môi trường
 load_dotenv()
@@ -154,8 +156,20 @@ async def danhsach(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dm = ws_dm.get_all_values()[1:]
     msg = "📋 **DANH MỤC**\n" + "\n".join([f"• {r[1]} (1t={r[2]}c)" for r in dm])
     await update.message.reply_text(msg, parse_mode="Markdown")
+# Tạo một web server nhỏ để Render không báo lỗi Port
+app_web = Flask(__name__)
+
+@app_web.route('/')
+def home():
+    return "Bot is running!"
+
+def run_web():
+    # Render cung cấp cổng qua biến môi trường PORT
+    port = int(os.environ.get("PORT", 8080))
+    app_web.run(host='0.0.0.0', port=port)
 
 if __name__ == "__main__":
+    threading.Thread(target=run_web, daemon=True).start()
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("nhap", nhap))
     app.add_handler(CommandHandler("xuat", xuat))
@@ -164,3 +178,4 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("ds", danhsach))
     print("Bot is running...")
     app.run_polling()
+
