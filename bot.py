@@ -1,111 +1,119 @@
 import os
 import json
-import gspread
 from datetime import datetime
 from dotenv import load_dotenv
-from oauth2client.service_account import ServiceAccountCredentials
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+import gspread
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # Load biến môi trường
 load_dotenv()
 
-# Cấu hình Google Sheets
-SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+# Render sẽ đọc chuỗi JSON này từ Environment Variables
+GOOGLE_CREDS = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
 
-# Xử lý lấy Credentials từ file hoặc biến môi trường (để deploy server)
-creds_json = os.getenv("GOOGLE_SHEETS_CREDS_JSON")
-if creds_json:
-    creds_dict = json.loads(creds_json)
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
-else:
-    creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", SCOPE)
+# Khởi tạo Google Sheets
+def get_sheets():
+    gc = gspread.service_account_from_dict(GOOGLE_CREDS)
+    sh = gc.open_by_key(SHEET_ID)
+    return sh.worksheet("DATA"), sh.worksheet("DANH_MUC")
 
-client = gspread.authorize(creds)
-spreadsheet = client.open_by_key(os.getenv("SHEET_ID"))
-inventory_sheet = spreadsheet.get_worksheet(0)  # Tab đầu tiên: Tồn kho
-history_sheet = spreadsheet.get_worksheet(1)    # Tab thứ hai: Lịch sử
+# --- HÀM TRỢ GIÚP ---
+def get_conversion_rate(ma_sp, dm_data):
+    """dm_data là danh sách từ worksheet DANH_MUC"""
+    for row in dm_data:
+        if row[0].upper() == ma_sp.upper():
+            return int(row[2])
+    return 1 # Mặc định là 1 nếu không tìm thấy
 
-# Danh sách Admin (ID Telegram)
-ADMIN_LIST = [int(id.strip()) for id in os.getenv("ADMIN_IDS").split(",")]
-
-def is_admin(user_id):
-    return user_id in ADMIN_LIST
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("📊 Kiểm tra tồn kho", callback_data='check_inv')],
-        [InlineKeyboardButton("📜 Xem lịch sử", callback_data='view_history')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "📦 *Hệ thống Quản lý Kho*\n\n"
-        "Hướng dẫn nhanh:\n"
-        "➕ Nhập: `/nhap Ten_SP So_Luong Ghi_Chu`\n"
-        "➖ Xuất: `/xuat Ten_SP So_Luong`",
-        reply_markup=reply_markup, parse_mode='Markdown'
-    )
-
-async def add_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("⛔ Bạn không có quyền!")
+# --- LỆNH NHẬP / XUẤT ---
+async def process_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
+    args = context.args
+    user = update.message.from_user
+    full_name = user.full_name if user.full_name else f"@{user.username}"
+    
+    if len(args) < 4:
+        await update.message.reply_text(f"⚠️ Cú pháp: /{mode.lower()} [kho] [mã] [tên] [sl+t/c]\nVí dụ: /nhap KHO1 BIA Bia 10t")
         return
 
     try:
-        name = context.args[0]
-        qty = int(context.args[1])
-        note = " ".join(context.args[2:]) if len(context.args) > 2 else ""
+        kho, ma = args[0].upper(), args[1].upper()
+        sl_raw = args[-1].lower()
+        ten = " ".join(args[2:-1])
         
-        cell = inventory_sheet.find(name)
-        if cell:
-            new_qty = int(inventory_sheet.cell(cell.row, 2).value) + qty
-            inventory_sheet.update_cell(cell.row, 2, new_qty)
+        ws_data, ws_dm = get_sheets()
+        dm_data = ws_dm.get_all_values()[1:]
+        
+        # Xử lý đơn vị
+        rate = get_conversion_rate(ma, dm_data)
+        if sl_raw.endswith('t'):
+            don_vi_goc = f"{sl_raw[:-1]} Thùng"
+            qty = int(sl_raw[:-1]) * rate
+        elif sl_raw.endswith('c'):
+            don_vi_goc = f"{sl_raw[:-1]} Chai"
+            qty = int(sl_raw[:-1])
         else:
-            inventory_sheet.append_row([name, qty])
-            new_qty = qty
+            await update.message.reply_text("❌ Thiếu đơn vị! Thêm 't' (thùng) hoặc 'c' (chai).")
+            return
 
-        history_sheet.append_row([str(datetime.now()), update.effective_user.first_name, "NHẬP", name, qty, note])
-        await update.message.reply_text(f"✅ Đã nhập {qty} {name}. Tồn hiện tại: {new_qty}")
-    except:
-        await update.message.reply_text("❌ Lỗi! Cú pháp: `/nhap Ten 10 Ghi_chu`", parse_mode='Markdown')
+        final_qty = qty if mode == "NHAP" else -abs(qty)
 
-async def remove_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
+        # Ghi vào Sheet DATA
+        row = [
+            datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+            kho, ma, ten, final_qty, mode, full_name, don_vi_goc, str(user.id)
+        ]
+        ws_data.append_row(row)
+        
+        await update.message.reply_text(
+            f"✅ {mode} thành công!\n📦 SP: {ten}\n🔢 Tổng quy đổi: {abs(final_qty)} chai\n👤 Người: {full_name}"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Lỗi: {str(e)}")
 
+async def nhap(u, c): await process_transaction(u, c, "NHAP")
+async def xuat(u, c): await process_transaction(u, c, "XUAT")
+
+# --- LỆNH TỒN KHO ---
+async def tonkho(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        name = context.args[0]
-        qty_to_remove = int(context.args[1])
+        ws_data, ws_dm = get_sheets()
+        data = ws_data.get_all_values()[1:]
+        dm = ws_dm.get_all_values()[1:]
         
-        cell = inventory_sheet.find(name)
-        if cell:
-            current_qty = int(inventory_sheet.cell(cell.row, 2).value)
-            if current_qty >= qty_to_remove:
-                new_qty = current_qty - qty_to_remove
-                inventory_sheet.update_cell(cell.row, 2, new_qty)
-                history_sheet.append_row([str(datetime.now()), update.effective_user.first_name, "XUẤT", name, -qty_to_remove, "Xuất hàng"])
-                await update.message.reply_text(f"✅ Đã xuất {qty_to_remove} {name}. Còn lại: {new_qty}")
-            else:
-                await update.message.reply_text(f"⚠️ Không đủ hàng! Hiện có: {current_qty}")
-        else:
-            await update.message.reply_text("❌ Sản phẩm không tồn tại.")
-    except:
-        await update.message.reply_text("❌ Lỗi! Cú pháp: `/xuat Ten 10`", parse_mode='Markdown')
+        conv_map = {r[0].upper(): int(r[2]) for r in dm}
+        name_map = {r[0].upper(): r[1] for r in dm}
+        
+        inventory = {}
+        for r in data:
+            k, m, q = r[1], r[2], int(r[4])
+            if k not in inventory: inventory[k] = {}
+            inventory[k][m] = inventory[k].get(m, 0) + q
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == 'check_inv':
-        data = inventory_sheet.get_all_records()
-        msg = "📊 *TỒN KHO HIỆN TẠI:*\n" + "\n".join([f"- {r['Ten']}: {r['SoLuong']}" for r in data])
-        await query.edit_message_text(msg, parse_mode='Markdown')
+        search_kho = context.args[0].upper() if context.args else None
+        msg = "📊 **TỒN KHO CHI TIẾT**\n"
+        
+        for kho, items in inventory.items():
+            if search_kho and kho != search_kho: continue
+            msg += f"\n🏢 **KHO: {kho}**\n"
+            for ma, total in items.items():
+                if total == 0: continue
+                rate = conv_map.get(ma, 1)
+                t, c = total // rate, total % rate
+                res = f"{t} thùng " if t > 0 else ""
+                res += f"{c} chai" if c > 0 else ""
+                msg += f"• `{ma}`: {res} ({total} chai)\n"
+        
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Lỗi: {str(e)}")
 
-if __name__ == '__main__':
-    app = ApplicationBuilder().token(os.getenv("TELEGRAM_TOKEN")).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("nhap", add_inventory))
-    app.add_handler(CommandHandler("xuat", remove_inventory))
-    app.add_handler(CallbackQueryHandler(button_handler))
+if __name__ == "__main__":
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("nhap", nhap))
+    app.add_handler(CommandHandler("xuat", xuat))
+    app.add_handler(CommandHandler("tonkho", tonkho))
     print("Bot is running...")
     app.run_polling()
