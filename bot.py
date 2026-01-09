@@ -142,6 +142,29 @@ async def thongketheogio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"\n🏠 Kho: {k}\n" + "\n".join([f"• {names.get(m, m)}: +{t['nhap']}c, -{t['xuat']}c" for m, t in items.items()])
         await update.message.reply_text(msg)
     except Exception as e: await update.message.reply_text(f"Lỗi: {e}")
+import google.generativeai as genai
+
+async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id not in ADMIN_IDS: return
+    
+    import pkg_resources
+    ai_version = pkg_resources.get_distribution("google-generativeai").version
+    
+    msg = f"🔍 **THÔNG SỐ HỆ THỐNG:**\n"
+    msg += f"• Thư viện AI: `{ai_version}`\n"
+    msg += f"• Model hiện tại: `gemini-1.5-flash-latest`\n"
+    
+    try:
+        # Thử liệt kê các model khả dụng để xem bot có quyền truy cập không
+        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        msg += f"• Model khả dụng: {len(available_models)} loại\n"
+        msg += f"• Trạng thái API: ✅ Kết nối tốt"
+    except Exception as e:
+        msg += f"• Trạng thái API: ❌ Lỗi ({str(e)})"
+        
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+# Đừng quên thêm handler: app.add_handler(CommandHandler("check", check_status))
 
 # 8. KHỞI CHẠY
 if __name__ == "__main__":
@@ -154,6 +177,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("thongketheogio", thongketheogio))
     app.add_handler(CommandHandler("ok", confirm_ok))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(CommandHandler("check", check_status))
     
     print("Bot is running...")
     app.run_polling()
+
