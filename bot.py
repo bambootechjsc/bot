@@ -20,7 +20,7 @@ GOOGLE_CREDS = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
 ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Tùy chỉnh danh sách kho của bạn tại đây
+# Tên kho hiển thị trên nút bấm (Cập nhật đúng tên kho của bạn)
 DANH_SACH_KHO = [["KHO_TONG", "KHO_LE", "KHO_DONG_LANH"]]
 
 if GEMINI_API_KEY:
@@ -31,13 +31,13 @@ else:
 
 app_web = Flask(__name__)
 @app_web.route('/')
-def home(): return "Warehouse Bot is Live!"
+def home(): return "Warehouse Bot is Online!"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
     app_web.run(host='0.0.0.0', port=port)
 
-# --- 2. HÀM TRỢ GIÚP ---
+# --- 2. HÀM HỖ TRỢ GOOGLE SHEETS ---
 def get_sheets():
     gc = gspread.service_account_from_dict(GOOGLE_CREDS)
     sh = gc.open_by_key(SHEET_ID)
@@ -54,12 +54,34 @@ def find_product_by_name(search_term, dm_data):
             return {"ma": row[0], "ten": row[1], "rate": int(row[2])}
     return None
 
-# --- 3. LỆNH THỦ CÔNG & TỒN KHO ---
+# --- 3. TỒN KHO & NHẬP/XUẤT BẰNG CHỮ (MANUAL) ---
+async def ton_kho_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id not in ADMIN_IDS: return
+    msg = await update.message.reply_text("📊 Đang tính tồn kho thực tế...")
+    try:
+        ws_data, ws_dm = get_sheets()
+        data_rows, dm_rows = ws_data.get_all_values()[1:], ws_dm.get_all_values()[1:]
+        names = {r[0]: r[1] for r in dm_rows}
+        res = {}
+        for r in data_rows:
+            if len(r) < 5: continue
+            k, m, q = r[1], r[2], int(r[4])
+            if k not in res: res[k] = {}
+            res[k][m] = res[k].get(m, 0) + q
+        
+        report = "📦 **BÁO CÁO TỒN KHO**\n"
+        for k, sps in res.items():
+            report += f"\n🏠 **{k}**\n"
+            items = [f"• {names.get(m, m)}: `{s}`" for m, s in sps.items() if s != 0]
+            report += "\n".join(items) if items else "• (Trống)"
+        await msg.edit_text(report, parse_mode="Markdown")
+    except Exception as e: await msg.edit_text(f"❌ Lỗi: {e}")
+
 async def process_manual(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
     if update.message.from_user.id not in ADMIN_IDS: return
     args = context.args
     if len(args) < 3:
-        return await update.message.reply_text(f"⚠️ HD: /{mode.lower()} [kho] [tên sp] [sl]\nVí dụ: /{mode.lower()} KHO_TONG coca 10c")
+        return await update.message.reply_text(f"⚠️ Cú pháp: /{mode.lower()} [kho] [tên sp] [số lượng]\nVí dụ: /{mode.lower()} KHO_TONG coca 10c")
     try:
         kho, sl_raw, search_term = args[0].upper(), args[-1].lower(), " ".join(args[1:-1])
         ws_data, ws_dm = get_sheets()
@@ -72,31 +94,18 @@ async def process_manual(update: Update, context: ContextTypes.DEFAULT_TYPE, mod
         await update.message.reply_text(f"✅ Đã ghi {mode}: {p['ten']} {sl_raw} vào {kho}")
     except Exception as e: await update.message.reply_text(f"❌ Lỗi: {e}")
 
-async def ton_kho_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.from_user.id not in ADMIN_IDS: return
-    msg = await update.message.reply_text("📊 Đang tính tồn kho...")
-    try:
-        ws_data, ws_dm = get_sheets()
-        data_rows, dm_rows = ws_data.get_all_values()[1:], ws_dm.get_all_values()[1:]
-        names = {r[0]: r[1] for r in dm_rows}
-        res = {}
-        for r in data_rows:
-            k, m, q = r[1], r[2], int(r[4])
-            if k not in res: res[k] = {}
-            res[k][m] = res[k].get(m, 0) + q
-        report = "📦 **TỒN KHO THỰC TẾ**\n"
-        for k, sps in res.items():
-            report += f"\n🏠 **{k}**\n" + "\n".join([f"• {names.get(m, m)}: `{s}`" for m, s in sps.items() if s != 0])
-        await msg.edit_text(report, parse_mode="Markdown")
-    except Exception as e: await msg.edit_text(f"❌ Lỗi: {e}")
-
 # --- 4. QUY TRÌNH AI (ẢNH) ---
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id not in ADMIN_IDS: return
+    await update.message.reply_chat_action("downloading_document")
     photo_file = await update.message.photo[-1].get_file()
-    context.user_data['temp_photo_bytes'] = await photo_file.download_as_bytearray()
+    # Chuyển thành list để lưu vào user_data an toàn
+    img_data = await photo_file.download_as_bytearray()
+    context.user_data['temp_photo_bytes'] = list(img_data)
+    
     keyboard = [["NHAP", "XUAT"]]
-    await update.message.reply_text("📥 Chọn loại giao dịch:", reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True))
+    await update.message.reply_text("📥 Bạn muốn NHẬP hay XUẤT hàng?", 
+                                   reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True))
     context.user_data['step'] = 'CHOOSING_TYPE'
 
 async def handle_interaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -105,7 +114,8 @@ async def handle_interaction(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if step == 'CHOOSING_TYPE' and text in ["NHAP", "XUAT"]:
         context.user_data['temp_type'] = text
-        await update.message.reply_text(f"📍 Chọn kho {text}:", reply_markup=ReplyKeyboardMarkup(DANH_SACH_KHO, one_time_keyboard=True, resize_keyboard=True))
+        await update.message.reply_text(f"📍 Chọn kho cho phiếu {text}:", 
+                                       reply_markup=ReplyKeyboardMarkup(DANH_SACH_KHO, one_time_keyboard=True, resize_keyboard=True))
         context.user_data['step'] = 'CHOOSING_KHO'
     
     elif step == 'CHOOSING_KHO':
@@ -113,38 +123,40 @@ async def handle_interaction(update: Update, context: ContextTypes.DEFAULT_TYPE)
         status = await update.message.reply_text(f"🤖 AI đang đọc phiếu {loai} tại {kho}...", reply_markup=ReplyKeyboardRemove())
         
         try:
-            ws_data, ws_dm = get_sheets()
-            dm_txt = "\n".join([f"- {r[1]} ({r[0]})" for r in ws_dm.get_all_values()[1:]])
-            img_bytes = context.user_data.get('temp_photo_bytes')
+            raw_img = context.user_data.get('temp_photo_bytes')
+            if not raw_img: raise Exception("Không tìm thấy ảnh.")
+            img_bytes = bytes(raw_img)
 
-            # 1. LƯU TRỮ ẢNH (Gửi vào Group trước khi gọi AI)
+            # 1. Lưu trữ ảnh ngay
             if STORAGE_CHANNEL_ID:
                 try:
-                    await context.bot.send_photo(chat_id=STORAGE_CHANNEL_ID, photo=bytes(img_bytes), 
-                                                 caption=f"📝 {loai} | {kho}\n⏰ {get_now_vntime()}")
-                except Exception as e: print(f"Lỗi gửi ảnh lưu trữ: {e}")
+                    await context.bot.send_photo(chat_id=STORAGE_CHANNEL_ID, photo=img_bytes, 
+                                                 caption=f"📝 {loai} | {kho} | {get_now_vntime()}", read_timeout=30)
+                except: print("Lỗi lưu ảnh Telegram")
 
-            # 2. GỌI GEMINI AI
-            prompt = f"Đọc phiếu {loai} vào kho {kho}. Danh mục:\n{dm_txt}\nTrả về JSON: {{\"type\": \"{loai}\", \"transactions\": [{{\"kho\": \"{kho}\", \"ma_sp\": \"Mã\", \"ten_sp\": \"Tên\", \"so_luong\": \"10c\"}}]}}"
-            response = model.generate_content([prompt, {"mime_type": "image/jpeg", "data": bytes(img_bytes)}])
+            # 2. Gọi AI phân tích
+            ws_data, ws_dm = get_sheets()
+            dm_txt = "\n".join([f"{r[0]}:{r[1]}" for r in ws_dm.get_all_values()[1:]])
             
-            # Làm sạch JSON để tránh lỗi BadRequest/Edit Message
+            await update.message.reply_chat_action("typing")
+            prompt = f"Bạn là kế toán kho. Đọc ảnh phiếu {loai} vào kho {kho}. Danh mục mã:tên:\n{dm_txt}\nNếu SP không có, đặt mã là 'NEW'. Trả JSON: {{\"type\": \"{loai}\", \"transactions\": [{{\"kho\": \"{kho}\", \"ma_sp\": \"Mã\", \"ten_sp\": \"Tên\", \"so_luong\": \"10c\"}}]}}"
+            
+            response = model.generate_content([prompt, {"mime_type": "image/jpeg", "data": img_bytes}])
             match = re.search(r'\{.*\}', response.text, re.DOTALL)
-            if not match: raise Exception("AI không trả về JSON.")
+            if not match: raise Exception("AI không trả dữ liệu JSON.")
             data = json.loads(match.group())
             context.user_data['pending_ai'] = data
 
             summary = f"🎯 **AI ĐỀ XUẤT ({loai} - {kho}):**\n" + "\n".join([f"• {t['ten_sp']}: {t['so_luong']}" for t in data['transactions']])
-            
             try:
                 await status.edit_text(summary + "\n\n/ok để ghi hoặc /huy.")
             except:
                 await update.message.reply_text(summary + "\n\n/ok để ghi hoặc /huy.")
             
-            context.user_data['step'] = None
         except Exception as e:
             await update.message.reply_text(f"❌ Lỗi: {str(e)}")
-            context.user_data.clear()
+        finally:
+            context.user_data['step'] = None
 
 # --- 5. XÁC NHẬN GHI SỔ ---
 async def confirm_ok(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -163,16 +175,21 @@ async def confirm_ok(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 row = next((r for r in dm_all if r[0] == ma), None)
                 rate = int(row[2]) if row else 1
-            num = int(re.findall(r'\d+', sl_raw)[0]) if re.findall(r'\d+', sl_raw) else 0
-            qty = (num * rate if 't' in sl_raw else num) * (1 if data['type']=="NHAP" else -1)
+            
+            nums = re.findall(r'\d+', sl_raw)
+            num = int(nums[0]) if nums else 0
+            qty = (num * rate if 't' in sl_raw else num) * (1 if data['type'] == "NHAP" else -1)
             ws_data.append_row([vntime, kho, ma, ten, qty, data['type'], update.message.from_user.full_name, sl_raw])
-        await update.message.reply_text(f"✅ Ghi xong! SP mới: {', '.join(news) if news else 'Không'}")
-    except Exception as e: await update.message.reply_text(f"❌ Lỗi ghi Sheet: {e}")
+        
+        await update.message.reply_text(f"✅ Đã ghi thành công! SP mới: {', '.join(news) if news else 'Không'}")
+    except Exception as e: await update.message.reply_text(f"❌ Lỗi: {e}")
     context.user_data.clear()
 
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
-    app = ApplicationBuilder().token(TOKEN).build()
+    # Tăng timeout để chống lỗi _request_wrapper
+    app = ApplicationBuilder().token(TOKEN).connect_timeout(60).read_timeout(60).write_timeout(60).build()
+    
     app.add_handler(CommandHandler("tonkho", ton_kho_cmd))
     app.add_handler(CommandHandler("nhap", lambda u,c: process_manual(u,c,"NHAP")))
     app.add_handler(CommandHandler("xuat", lambda u,c: process_manual(u,c,"XUAT")))
@@ -180,4 +197,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("huy", lambda u,c: u.message.reply_text("Đã hủy.", reply_markup=ReplyKeyboardRemove())))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_interaction))
+    
+    print("Bot đang chạy...")
     app.run_polling()
