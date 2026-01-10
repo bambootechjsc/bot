@@ -10,6 +10,7 @@ import google.generativeai as genai
 from flask import Flask
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.constants import ChatAction # Import hằng số chuẩn
 
 # --- 1. CẤU HÌNH ---
 load_dotenv()
@@ -20,7 +21,6 @@ GOOGLE_CREDS = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
 ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Tên kho hiển thị trên nút bấm (Cập nhật đúng tên kho của bạn)
 DANH_SACH_KHO = [["KHO_TONG", "KHO_LE", "KHO_DONG_LANH"]]
 
 if GEMINI_API_KEY:
@@ -31,13 +31,13 @@ else:
 
 app_web = Flask(__name__)
 @app_web.route('/')
-def home(): return "Warehouse Bot is Online!"
+def home(): return "Warehouse Bot is Running!"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
     app_web.run(host='0.0.0.0', port=port)
 
-# --- 2. HÀM HỖ TRỢ GOOGLE SHEETS ---
+# --- 2. HÀM HỖ TRỢ ---
 def get_sheets():
     gc = gspread.service_account_from_dict(GOOGLE_CREDS)
     sh = gc.open_by_key(SHEET_ID)
@@ -54,7 +54,7 @@ def find_product_by_name(search_term, dm_data):
             return {"ma": row[0], "ten": row[1], "rate": int(row[2])}
     return None
 
-# --- 3. TỒN KHO & NHẬP/XUẤT BẰNG CHỮ (MANUAL) ---
+# --- 3. CÁC LỆNH CHỮ (MANUAL) ---
 async def ton_kho_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id not in ADMIN_IDS: return
     msg = await update.message.reply_text("📊 Đang tính tồn kho thực tế...")
@@ -81,7 +81,7 @@ async def process_manual(update: Update, context: ContextTypes.DEFAULT_TYPE, mod
     if update.message.from_user.id not in ADMIN_IDS: return
     args = context.args
     if len(args) < 3:
-        return await update.message.reply_text(f"⚠️ Cú pháp: /{mode.lower()} [kho] [tên sp] [số lượng]\nVí dụ: /{mode.lower()} KHO_TONG coca 10c")
+        return await update.message.reply_text(f"⚠️ HD: /{mode.lower()} [kho] [tên sp] [sl]\nVí dụ: /{mode.lower()} KHO_TONG coca 10c")
     try:
         kho, sl_raw, search_term = args[0].upper(), args[-1].lower(), " ".join(args[1:-1])
         ws_data, ws_dm = get_sheets()
@@ -97,9 +97,10 @@ async def process_manual(update: Update, context: ContextTypes.DEFAULT_TYPE, mod
 # --- 4. QUY TRÌNH AI (ẢNH) ---
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id not in ADMIN_IDS: return
-    await update.message.reply_chat_action("downloading_document")
+    # Sử dụng ChatAction chuẩn để tránh lỗi Wrong parameter
+    await update.message.reply_chat_action(ChatAction.TYPING)
+    
     photo_file = await update.message.photo[-1].get_file()
-    # Chuyển thành list để lưu vào user_data an toàn
     img_data = await photo_file.download_as_bytearray()
     context.user_data['temp_photo_bytes'] = list(img_data)
     
@@ -124,22 +125,20 @@ async def handle_interaction(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
         try:
             raw_img = context.user_data.get('temp_photo_bytes')
-            if not raw_img: raise Exception("Không tìm thấy ảnh.")
+            if not raw_img: raise Exception("Không thấy ảnh.")
             img_bytes = bytes(raw_img)
 
-            # 1. Lưu trữ ảnh ngay
             if STORAGE_CHANNEL_ID:
                 try:
                     await context.bot.send_photo(chat_id=STORAGE_CHANNEL_ID, photo=img_bytes, 
-                                                 caption=f"📝 {loai} | {kho} | {get_now_vntime()}", read_timeout=30)
-                except: print("Lỗi lưu ảnh Telegram")
+                                                 caption=f"📝 {loai} | {kho}\n⏰ {get_now_vntime()}", read_timeout=30)
+                except: print("Lỗi gửi ảnh nhóm")
 
-            # 2. Gọi AI phân tích
+            await update.message.reply_chat_action(ChatAction.TYPING)
             ws_data, ws_dm = get_sheets()
             dm_txt = "\n".join([f"{r[0]}:{r[1]}" for r in ws_dm.get_all_values()[1:]])
             
-            await update.message.reply_chat_action("typing")
-            prompt = f"Bạn là kế toán kho. Đọc ảnh phiếu {loai} vào kho {kho}. Danh mục mã:tên:\n{dm_txt}\nNếu SP không có, đặt mã là 'NEW'. Trả JSON: {{\"type\": \"{loai}\", \"transactions\": [{{\"kho\": \"{kho}\", \"ma_sp\": \"Mã\", \"ten_sp\": \"Tên\", \"so_luong\": \"10c\"}}]}}"
+            prompt = f"Đọc phiếu {loai} kho {kho}. Danh mục:\n{dm_txt}\nTrả JSON: {{\"type\": \"{loai}\", \"transactions\": [{{\"kho\": \"{kho}\", \"ma_sp\": \"Mã\", \"ten_sp\": \"Tên\", \"so_luong\": \"10c\"}}]}}"
             
             response = model.generate_content([prompt, {"mime_type": "image/jpeg", "data": img_bytes}])
             match = re.search(r'\{.*\}', response.text, re.DOTALL)
@@ -158,7 +157,7 @@ async def handle_interaction(update: Update, context: ContextTypes.DEFAULT_TYPE)
         finally:
             context.user_data['step'] = None
 
-# --- 5. XÁC NHẬN GHI SỔ ---
+# --- 5. XÁC NHẬN ---
 async def confirm_ok(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = context.user_data.get('pending_ai')
     if not data: return
@@ -181,13 +180,13 @@ async def confirm_ok(update: Update, context: ContextTypes.DEFAULT_TYPE):
             qty = (num * rate if 't' in sl_raw else num) * (1 if data['type'] == "NHAP" else -1)
             ws_data.append_row([vntime, kho, ma, ten, qty, data['type'], update.message.from_user.full_name, sl_raw])
         
-        await update.message.reply_text(f"✅ Đã ghi thành công! SP mới: {', '.join(news) if news else 'Không'}")
+        await update.message.reply_text(f"✅ Đã ghi xong!")
     except Exception as e: await update.message.reply_text(f"❌ Lỗi: {e}")
     context.user_data.clear()
 
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
-    # Tăng timeout để chống lỗi _request_wrapper
+    # Timeout 60s
     app = ApplicationBuilder().token(TOKEN).connect_timeout(60).read_timeout(60).write_timeout(60).build()
     
     app.add_handler(CommandHandler("tonkho", ton_kho_cmd))
@@ -198,5 +197,4 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_interaction))
     
-    print("Bot đang chạy...")
     app.run_polling()
